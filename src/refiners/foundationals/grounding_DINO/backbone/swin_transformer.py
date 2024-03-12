@@ -7,7 +7,6 @@ from torch import Tensor, device as Device, dtype as DType
 
 import refiners.fluxion.layers as fl
 from refiners.fluxion.utils import pad
-from refiners.foundationals.ViT_matte.vit_backbone import WindowMerge, WindowPartition  # type: ignore
 
 
 class PatchEncoder(fl.Chain):
@@ -55,7 +54,7 @@ def window_reverse(windows: Tensor, window_size: int, H: int, W: int):
     return x
 
 
-class RelativePositionAttention(fl.WeightedModule, fl.ContextModule):
+class RelativePositionAttention(fl.ContextModule):
     def __init__(
         self,
         embedding_dim: int,
@@ -88,8 +87,8 @@ class RelativePositionAttention(fl.WeightedModule, fl.ContextModule):
         self.relative_position_index = relative_coords.sum(-1)
 
     def forward(self, x: Tensor) -> Tensor:
-        B_, N, c = x.shape
-        C = c // 3
+        B_, N, C = x.shape
+        x = self.qkv(x)
         x = x.reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
 
         query, key, value = x.unbind(dim=0)
@@ -205,6 +204,15 @@ class ReverseCyclicShift(fl.ContextModule):
         return x
 
 
+class Softmax(fl.Module):
+    def __init__(self, dim: int = -1) -> None:
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.softmax(x, dim=self.dim)
+
+
 class SwinTransformerBlock(fl.Chain):
     def __init__(
         self,
@@ -219,7 +227,6 @@ class SwinTransformerBlock(fl.Chain):
         device: Device | str | None = None,
         dtype: DType | None = None,
     ):
-        print("Welcome to Swin Transformer Block :)")
         self.dim = dim
         self.num_heads = num_heads
         self.window_size = window_size
@@ -245,7 +252,6 @@ class SwinTransformerBlock(fl.Chain):
                 fl.Reshape(self.H, self.W, self.dim),
                 Pad(window_size=self.window_size, W=self.W, H=self.H),
                 CyclicShift(shift_size=self.shift_size, window_size=self.window_size),
-                fl.Linear(dim, dim * 3, bias=self.qkv_bias, device=device, dtype=dtype),
                 RelativePositionAttention(
                     embedding_dim=self.dim,
                     num_heads=self.num_heads,
@@ -253,6 +259,7 @@ class SwinTransformerBlock(fl.Chain):
                     device=device,
                     dtype=dtype,
                 ),
+                Softmax(dim=-1),
                 ReverseCyclicShift(
                     shift_size=self.shift_size,
                     window_size=self.window_size,
@@ -373,18 +380,19 @@ class BasicLayer(fl.Chain):
         window_size: int,
         mlp_ratio: float,
         downsample: type[PatchMerging] | None,
+        norm_feature: int | None,
         H: int,
         W: int,
         device: Device | str | None = None,
         dtype: DType | None = None,
     ) -> None:
-        print("Welcome to Basic Layer :)")
         self.dim = dim
         self.depth = depth
         self.num_heads = num_heads
         self.window_size = window_size
         self.shift_size = window_size // 2
         self.mlp_ratio = mlp_ratio
+        self.norm_feature = norm_feature
         self.H = H
         self.W = W
         self.Hp = int(np.ceil(self.H / self.window_size)) * self.window_size
@@ -406,8 +414,25 @@ class BasicLayer(fl.Chain):
                 )
                 for i in range(self.depth)
             ],
+            fl.SetContext(context="SwinT", key="x"),
+            fl.Chain(
+                fl.LayerNorm(self.norm_feature),
+                fl.Reshape(self.H, self.W, self.norm_feature),
+                fl.Permute(0, 3, 1, 2),
+                fl.Lambda(func=self.update_outs),
+            )
+            if (self.norm_feature)
+            else fl.Identity(),
+            fl.UseContext(context="SwinT", key="x"),
             downsample(self.dim, self.H, self.W) if downsample else fl.Identity(),
         )
+
+    def update_outs(self, x: Tensor):
+        context = self.use_context(context_name="SwinT")
+        outs = context["outs"]
+        outs.append(x)
+        context.update({"outs": outs})
+        return x
 
 
 class SwinTransformer(fl.Chain):
@@ -425,7 +450,6 @@ class SwinTransformer(fl.Chain):
         device: Device | str | None = None,
         dtype: DType | None = None,
     ):
-        print("Welcome to Swin Transformer :)")
         self.num_layers = len(depths)
         self.embed_dim = embed_dim
         self.out_indices = out_indices
@@ -449,31 +473,20 @@ class SwinTransformer(fl.Chain):
                         window_size=window_size,
                         mlp_ratio=mlp_ratio,
                         downsample=PatchMerging if i_layer < self.num_layers - 1 else None,
+                        norm_feature=self.num_features[i_layer] if i_layer in self.out_indices else None,
                         H=int(np.ceil(self.H / (2 ** (i_layer)))),
                         W=int(np.ceil(self.W / (2 ** (i_layer)))),
                         device=device,
                         dtype=dtype,
                     ),
-                    fl.Lambda(func=self.monitor),
-                    fl.Chain(
-                        fl.LayerNorm(self.num_features[i_layer]),
-                        fl.Lambda(func=self.monitor),
-                        fl.Reshape(-1, self.H, self.W, self.num_features[i_layer]),
-                        fl.Permute(0, 3, 1, 2),
-                    )
-                    if (i_layer in self.out_indices)
-                    else fl.Identity(),
                 )
                 for i_layer in range(self.num_layers)
             ],
+            fl.UseContext(context="SwinT", key="outs"),
         )
 
-    def init_context(self):
-        return {"SwinT": {"attn_mask": None, "dim_p": None, "pad": None}}
-
-    def monitor(self, x: Tensor) -> Tensor:
-        print("HELLO: ", x.shape)
-        return x
+    def init_context(self):  # type:ignore
+        return {"SwinT": {"attn_mask": None, "dim_p": None, "pad": None, "outs": []}}  # type:ignore
 
 
 class SwinTransformerH(SwinTransformer):

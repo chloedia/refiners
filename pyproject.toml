@@ -10,6 +10,13 @@ dependencies = [
     "pillow>=10.1.0",
     "jaxtyping>=0.2.23",
     "packaging>=23.2",
+    "supervision>=0.18.0",
+    "torchvision>=0.17.0",
+    "transformers>=4.38.0",
+    "addict>=2.4.0",
+    "yapf>=0.40.2",
+    "pycocotools>=2.0.7",
+    "timm>=0.9.16",
 ]
 readme = "README.md"
 requires-python = ">= 3.10"
