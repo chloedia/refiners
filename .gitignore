@@ -37,3 +37,6 @@ requirements-dev.lock
 htmlcov/
 .coverage
 .coverage.*
+
+#base model layer diffuse
+src/refiners/foundationals/source_layerdiffuse/

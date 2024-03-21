@@ -35,7 +35,6 @@ class Resnet(Sum):
             else Identity()
         )
         super().__init__(
-            shortcut,
             Chain(
                 GroupNorm(channels=in_channels, num_groups=num_groups, device=device, dtype=dtype),
                 SiLU(),
@@ -58,6 +57,7 @@ class Resnet(Sum):
                     dtype=dtype,
                 ),
             ),
+            shortcut,
         )
 
 
